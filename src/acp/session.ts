@@ -54,10 +54,8 @@ type SessionCreateParams = {
   piCommand?: string
   /** ACP additionalDirectories: extra workspace roots beyond cwd (absolute paths). */
   additionalDirectories?: string[]
-  /** Path to the generated MCP config temp file, passed to pi via `--mcp-config`. */
-  mcpConfigPath?: string
-  /** Cleanup for the generated MCP config temp file, invoked when the session is closed. */
-  mcpConfigCleanup?: () => void
+  /** Base64 `{ "mcpServers": { … } }` registered with pi's native MCP for this session. */
+  mcpConfigPayload?: string
   /** Full ACP client capabilities from initialize, used to gate wire features (terminals, plan, fs). */
   clientCapabilities?: ClientCapabilities
   /** Per-request pi RPC timeout (ms); falls back to the process default when unset. */
@@ -201,11 +199,6 @@ export class SessionManager {
     } catch {
       // ignore
     }
-    try {
-      s.mcpConfigCleanup?.()
-    } catch {
-      // ignore
-    }
     this.sessions.delete(sessionId)
   }
 
@@ -236,7 +229,7 @@ export class SessionManager {
         cwd: params.cwd,
         piCommand: params.piCommand,
         additionalDirectories: params.additionalDirectories,
-        mcpConfigPath: params.mcpConfigPath,
+        mcpConfigPayload: params.mcpConfigPayload,
         rpcTimeoutMs: params.rpcTimeoutMs
       })
     } catch (e) {
@@ -268,7 +261,6 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       additionalDirectories: params.additionalDirectories ?? [],
-      mcpConfigCleanup: params.mcpConfigCleanup,
       clientCapabilities: params.clientCapabilities
     })
 
@@ -298,7 +290,6 @@ export class SessionManager {
       conn: params.conn,
       fileCommands: params.fileCommands ?? [],
       additionalDirectories: params.additionalDirectories ?? [],
-      mcpConfigCleanup: params.mcpConfigCleanup,
       clientCapabilities: params.clientCapabilities
     })
 
@@ -312,7 +303,6 @@ export class PiAcpSession {
   readonly cwd: string
   readonly mcpServers: McpServer[]
   readonly additionalDirectories: string[]
-  readonly mcpConfigCleanup?: () => void
   private readonly clientCapabilities?: ClientCapabilities
 
   private startupInfo: string | null = null
@@ -358,14 +348,12 @@ export class PiAcpSession {
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
     additionalDirectories?: string[]
-    mcpConfigCleanup?: () => void
     clientCapabilities?: ClientCapabilities
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
     this.mcpServers = opts.mcpServers
     this.additionalDirectories = opts.additionalDirectories ?? []
-    this.mcpConfigCleanup = opts.mcpConfigCleanup
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []

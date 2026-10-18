@@ -1,9 +1,34 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import * as readline from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+
+/**
+ * Locate the MCP bridge extension that ships with this package (`src/pi-extension-mcp.ts`, built to
+ * `dist/pi-extension-mcp.js`). Resolved relative to this module so it works from `dist/` (npx,
+ * `pi install`) and from `src/` (tsx dev). Returns null when neither exists — the session still
+ * starts, just without ACP-provided MCP servers.
+ */
+function resolveBundledMcpExtension(): string | null {
+  let here: string
+  try {
+    here = dirname(fileURLToPath(import.meta.url))
+  } catch {
+    return null
+  }
+  const candidates = [
+    join(here, 'pi-extension-mcp.js'),
+    join(here, 'pi-extension-mcp.ts'),
+    join(here, '..', 'src', 'pi-extension-mcp.ts')
+  ]
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  return null
+}
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -83,11 +108,12 @@ type SpawnParams = {
    */
   additionalDirectories?: readonly string[]
   /**
-   * Path to a generated MCP config passed to pi-mcp-adapter via `--mcp-config`. pi ignores the flag
-   * (it's an extension flag), and the adapter reads it as its pi-global config source — so we never
-   * write into pi's own `<cwd>/.pi/` config namespace.
+   * Base64 `{ "mcpServers": { … } }` (see `encodeMcpConfig`). Handed to pi in `PI_ACP_MCP_CONFIG`,
+   * which the bundled extension (`src/pi-extension-mcp.ts`, loaded via `--extension`) reads and
+   * registers with `pi.registerMcpServer()` for this session only. Environment rather than a temp
+   * file so client-supplied secrets never land on disk, and `<cwd>/.pi/` is never written.
    */
-  mcpConfigPath?: string
+  mcpConfigPayload?: string
   /** Per-request RPC timeout (ms). Falls back to {@link DEFAULT_RPC_TIMEOUT_MS} when unset. */
   rpcTimeoutMs?: number
 }
@@ -200,9 +226,23 @@ export class PiRpcProcess {
     // (e.g. MCP extensions, prompt templates for workflows).
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
-    // pi treats unknown `--` flags as extension flags (no error in rpc mode); pi-mcp-adapter reads
-    // `--mcp-config` from argv. This overrides only the adapter's pi-global source, not pi's config dir.
-    if (params.mcpConfigPath) args.push('--mcp-config', params.mcpConfigPath)
+    // Native MCP: pi reads MCP configuration only from files (`~/.pi/agent/mcp.json`,
+    // `<cwd>/.pi/mcp.json`) — there is no CLI flag for a session-scoped config, and writing into the
+    // project's config namespace would leak into unrelated pi sessions. So hand the ACP client's
+    // servers to pi's own `pi.registerMcpServer()` API through the extension bundled with this
+    // package; the payload rides in the environment and is deleted by the extension on load.
+    const env: NodeJS.ProcessEnv = { ...process.env, PI_ACP: '1' }
+    if (params.mcpConfigPayload) {
+      const extensionPath = resolveBundledMcpExtension()
+      if (extensionPath) {
+        env.PI_ACP_MCP_CONFIG = params.mcpConfigPayload
+        args.push('--extension', shouldUseShellForPiCommand(cmd) ? `"${extensionPath}"` : extensionPath)
+      } else {
+        process.stderr.write(
+          '[pi-acp] bundled MCP bridge extension not found; ACP-provided MCP servers will not load\n'
+        )
+      }
+    }
 
     // Workspace roots go through `--append-system-prompt`, which pi resolves from a
     // file when the argument is an existing path. Using a temp file (instead of inline
@@ -229,9 +269,10 @@ export class PiRpcProcess {
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      // Mark the spawned pi as running under the ACP adapter so the bundled pi extension
+      // `PI_ACP=1` marks the spawned pi as running under the ACP adapter so the bundled pi extension
       // (subagent → plan bridge) activates here but stays inert in a normal terminal `pi`.
-      env: { ...process.env, PI_ACP: '1' },
+      // `PI_ACP_MCP_CONFIG` (when set) carries this session's ACP MCP servers.
+      env,
       shell: shouldUseShellForPiCommand(cmd)
     })
 

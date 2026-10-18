@@ -1,5 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { McpServer } from '@agentclientprotocol/sdk'
 import { getAgentDir } from './pi-settings.js'
@@ -9,8 +8,12 @@ import { getPiAcpMcpPolicyPath } from './paths.js'
 // that pi-acp authored, never a hand-written `.pi/mcp.json`.
 const GENERATED_MARKER = 'pi-acp'
 
-type PiMcpStdioEntry = { command: string; args?: string[]; env?: Record<string, string> }
-type PiMcpHttpEntry = { url: string; headers?: Record<string, string> }
+type PiMcpBase = { exposure?: PiMcpExposure }
+type PiMcpStdioEntry = PiMcpBase & { command: string; args?: string[]; env?: Record<string, string> }
+/** pi's MCP tool exposure. `codemode` is pi's default: reachable from codemode scripts / tool_search. */
+export type PiMcpExposure = 'codemode' | 'deferred' | 'direct' | 'hidden'
+
+type PiMcpHttpEntry = PiMcpBase & { url: string; headers?: Record<string, string> }
 type PiMcpEntry = PiMcpStdioEntry | PiMcpHttpEntry
 
 export type PiMcpConfig = {
@@ -20,20 +23,19 @@ export type PiMcpConfig = {
 
 export type McpTranslation = {
   config: PiMcpConfig
-  /** Names of servers we could not express in pi-mcp-adapter's schema (sse / acp). */
+  /** Names of servers we could not express in pi's native MCP schema (sse / acp). */
   skipped: string[]
   /** Names skipped because a policy said to defer to the user's own (lower-precedence) config. */
   preserved: string[]
 }
 
 /**
- * Policy consulted when generating `.pi/mcp.json`, loaded from
+ * Policy consulted when generating ACP-provided servers, loaded from
  * `<pi-acp dataDir>/mcp-policy.json` (default `~/.pi/pi-acp/mcp-policy.json`).
  *
- * Why: the ACP `McpServer` shape can't express bearer auth, and pi-acp writing a server (repointing
- * its URL) trips pi-mcp-adapter's URL-bound credential stripping → 401 on an otherwise-configured
- * server; the generated `<cwd>/.pi/mcp.json` also outranks the user's global config. So the operator
- * controls which servers pi-acp may generate — **same semantics pi-subagents uses for tool/extension
+ * Why: the ACP `McpServer` shape can't express bearer auth, and a client-supplied server entry may
+ * collide with one the user configured themselves (with its own credentials). So the operator
+ * controls which servers pi-acp may register — **same semantics pi-subagents uses for tool/extension
  * inheritance** (`true | string[] | false` + an exclude denylist):
  *
  *  - `generate`: which servers pi-acp may write. `true`/`"*"`/omitted = all (default, current
@@ -42,18 +44,28 @@ export type McpTranslation = {
  *    in place. (Names are case-insensitive.)
  *  - `exclude`: denylist applied after `generate` (exclude wins) — e.g. a globally-configured,
  *    bearer-auth'd server you never want pi-acp to override.
- *  - `auth`: for a server pi-acp DOES generate, write `Authorization: Bearer $env:<VAR>` (+ extra
- *    headers). pi-mcp-adapter interpolates `$env:` at connect, so the token is never on disk and,
- *    being the entry's own header, survives the URL-bound stripping.
+ *  - `auth`: for a server pi-acp DOES register, add `Authorization: Bearer ${VAR}` (+ extra
+ *    headers). pi interpolates `${VAR}` at connect, so the token never travels in the payload and
+ *    stays out of the client's hands.
+ *
+ *  - `defaultExposure` / `exposure`: pi's `codemode` default keeps MCP tools out of the model's tool
+ *    list (they are reached through `codemode` scripts and `tool_search`). Set `"direct"` to declare
+ *    them like built-in tools — what a client expecting the old pi-mcp-adapter behavior wants — or
+ *    `"deferred"`/`"hidden"` per server.
  *
  * Shape: `{ "generate": true | "*" | ["a","b"] | false, "exclude": ["x"],
- *          "auth": { "<name>": { "bearerTokenEnv": "VAR", "headers": {…} } } }`
+ *          "auth": { "<name>": { "bearerTokenEnv": "VAR", "headers": {…} } },
+ *          "defaultExposure": "codemode", "exposure": { "<name>": "direct" } }`
  */
 export type McpServerAuth = { bearerTokenEnv?: string; headers?: Record<string, string> }
 export type McpPolicy = {
   generate?: boolean | '*' | string[]
   exclude?: string[]
   auth?: Record<string, McpServerAuth>
+  /** Exposure applied to every generated server unless `exposure[name]` overrides it. */
+  defaultExposure?: PiMcpExposure
+  /** Per-server exposure override (case-insensitive names). */
+  exposure?: Record<string, PiMcpExposure>
 }
 
 type NameValue = { name: string; value: string }
@@ -63,13 +75,36 @@ export function loadMcpPolicy(path: string = getPiAcpMcpPolicyPath()): McpPolicy
   try {
     const raw = JSON.parse(readFileSync(path, 'utf-8')) as unknown
     if (!raw || typeof raw !== 'object') return {}
-    const obj = raw as { generate?: unknown; exclude?: unknown; auth?: unknown }
+    const obj = raw as {
+      generate?: unknown
+      exclude?: unknown
+      auth?: unknown
+      exposure?: unknown
+      defaultExposure?: unknown
+    }
     const out: McpPolicy = {}
 
     if (typeof obj.generate === 'boolean' || obj.generate === '*') out.generate = obj.generate
     else if (Array.isArray(obj.generate)) out.generate = obj.generate.filter((x): x is string => typeof x === 'string')
 
     if (Array.isArray(obj.exclude)) out.exclude = obj.exclude.filter((x): x is string => typeof x === 'string')
+
+    const validExposures: readonly PiMcpExposure[] = ['codemode', 'deferred', 'direct', 'hidden']
+    const asExposure = (v: unknown): PiMcpExposure | undefined =>
+      typeof v === 'string' && (validExposures as readonly string[]).includes(v) ? (v as PiMcpExposure) : undefined
+
+    out.defaultExposure = asExposure((obj as { defaultExposure?: unknown }).defaultExposure)
+    if (!out.defaultExposure) delete out.defaultExposure
+
+    const exposureRaw = (obj as { exposure?: unknown }).exposure
+    if (exposureRaw && typeof exposureRaw === 'object' && !Array.isArray(exposureRaw)) {
+      const exposure: Record<string, PiMcpExposure> = {}
+      for (const [name, val] of Object.entries(exposureRaw as Record<string, unknown>)) {
+        const parsed = asExposure(val)
+        if (parsed) exposure[name] = parsed
+      }
+      if (Object.keys(exposure).length) out.exposure = exposure
+    }
 
     if (obj.auth && typeof obj.auth === 'object') {
       const auth: Record<string, McpServerAuth> = {}
@@ -104,6 +139,15 @@ function shouldGenerate(name: string, policy: McpPolicy): boolean {
   return gen.some(n => n.toLowerCase() === lc)
 }
 
+/** Case-insensitive lookup: policy server names are matched leniently (README documents that). */
+function lookup<T>(map: Record<string, T> | undefined, name: string): T | undefined {
+  if (!map) return undefined
+  if (name in map) return map[name]
+  const lc = name.toLowerCase()
+  for (const key of Object.keys(map)) if (key.toLowerCase() === lc) return map[key]
+  return undefined
+}
+
 function toRecord(pairs: readonly NameValue[] | undefined): Record<string, string> {
   const out: Record<string, string> = {}
   for (const p of pairs ?? []) {
@@ -113,9 +157,9 @@ function toRecord(pairs: readonly NameValue[] | undefined): Record<string, strin
 }
 
 /**
- * Translate ACP `McpServer[]` into the `mcpServers` map read by pi-mcp-adapter
- * (https://github.com/nicobailon/pi-mcp-adapter). stdio and http servers translate
- * cleanly; sse / acp variants are not expressible and are reported as `skipped`.
+ * Translate ACP `McpServer[]` into pi's native `mcpServers` entry shape (as in `mcp.json` and the
+ * `pi.registerMcpServer()` config). stdio and http servers translate cleanly; sse / acp variants are
+ * not expressible (pi rejects `sse`) and are reported as `skipped`.
  */
 export function translateMcpServers(
   servers: readonly McpServer[] | undefined | null,
@@ -136,7 +180,8 @@ export function translateMcpServers(
       continue
     }
 
-    const rule = policy.auth?.[name]
+    const rule = lookup(policy.auth, name)
+    const exposure = lookup(policy.exposure, name) ?? policy.defaultExposure
     const type = (server as { type?: string }).type
 
     if (!type || type === 'stdio') {
@@ -152,6 +197,7 @@ export function translateMcpServers(
       }
       const env = toRecord(stdio.env)
       if (Object.keys(env).length) entry.env = env
+      if (exposure) entry.exposure = exposure
       mcpServers[name] = entry
     } else if (type === 'http') {
       const http = server as { url?: string; headers?: NameValue[] }
@@ -162,14 +208,15 @@ export function translateMcpServers(
       }
       const entry: PiMcpHttpEntry = { url }
       // Client-sent headers, then policy headers, then a policy bearer — policy wins. The bearer is
-      // written as `$env:VAR` so pi-mcp-adapter resolves it at connect (never stored on disk) and it
-      // survives URL-bound stripping (it's this entry's own header, not inherited).
+      // written as `${VAR}` so pi resolves it at connect from the environment; the secret itself never
+      // enters the payload.
       const headers: Record<string, string> = { ...toRecord(http.headers), ...(rule?.headers ?? {}) }
-      if (rule?.bearerTokenEnv) headers['Authorization'] = `Bearer $env:${rule.bearerTokenEnv}`
+      if (rule?.bearerTokenEnv) headers['Authorization'] = `Bearer \${${rule.bearerTokenEnv}}`
       if (Object.keys(headers).length) entry.headers = headers
+      if (exposure) entry.exposure = exposure
       mcpServers[name] = entry
     } else {
-      // sse / acp: not expressible in pi-mcp-adapter's config shape.
+      // sse / acp: not expressible in pi's native MCP config shape.
       skipped.push(name)
     }
   }
@@ -177,14 +224,15 @@ export function translateMcpServers(
   return { config: { mcpServers, _generatedBy: GENERATED_MARKER }, skipped, preserved }
 }
 
-export type McpConfigHandle = {
-  path: string
-  /** Remove the generated file. No-op if the file was replaced by a non-generated one. */
-  cleanup: () => void
-}
-
-export type WriteMcpConfigResult = {
-  handle: McpConfigHandle | null
+export type McpConfigPayload = {
+  /**
+   * Base64 of `{ "mcpServers": { … } }`, handed to pi in `PI_ACP_MCP_CONFIG` for the bundled
+   * extension (`src/pi-extension-mcp.ts`) to register with `pi.registerMcpServer()`. `null` when
+   * there is nothing to register. Kept in the environment rather than a temp file so no
+   * client-supplied secret is ever written to disk.
+   */
+  payload: string | null
+  /** Servers we could not express in pi's config shape (sse / acp). */
   skipped: string[]
   /** Server names not generated because the policy said to defer to the user's own config. */
   preserved: string[]
@@ -200,48 +248,34 @@ function isGeneratedConfig(path: string): boolean {
 }
 
 /**
- * Write the ACP-provided MCP servers to a **session-scoped temp file** for pi-mcp-adapter, passed to
- * pi via `--mode rpc --mcp-config <path>` (see PiRpcProcess.spawn). This deliberately does NOT write
- * `<cwd>/.pi/mcp.json`: that path is pi's own highest-precedence *project config namespace*
- * (settings, prompts, trust, mcp), so writing there overrode the user's global config, persisted
- * past the session, and poisoned unrelated (even non-ACP) pi sessions launched from the same cwd.
- * `--mcp-config` overrides only pi-mcp-adapter's pi-global source, never pi's config dir; the temp
- * file is removed on session end (and a leaked one only shadows the rarely-used `<agentDir>/mcp.json`).
- * Returns `handle: null` when there is nothing to write.
+ * Encode the ACP-provided MCP servers for pi's native MCP support.
+ *
+ * pi has no flag for a session-scoped MCP config: it reads `~/.pi/agent/mcp.json` and the project's
+ * `.pi/mcp.json`, and nothing else (`--no-mcp` is the only MCP flag). pi-acp therefore ships a small
+ * extension (`src/pi-extension-mcp.ts`, loaded via `--extension`) that registers these servers with
+ * `pi.registerMcpServer()` for the session. The config rides in `PI_ACP_MCP_CONFIG` as base64, so:
+ *
+ * - nothing is written to disk (no temp file, no client-supplied header/env secret in a file), and
+ * - `<cwd>/.pi/mcp.json` is untouched — that path is pi's highest-precedence *project config
+ *   namespace* (settings, prompts, trust, mcp); writing there overrode the user's global config,
+ *   persisted past the session, and poisoned unrelated (even non-ACP) pi sessions in the same cwd.
+ *
+ * Registrations live exactly as long as the session and are never saved. Returns `payload: null`
+ * when there is nothing to register.
  */
-export function writeMcpConfig(
+export function encodeMcpConfig(
   servers: readonly McpServer[] | undefined | null,
   policy: McpPolicy = loadMcpPolicy()
-): WriteMcpConfigResult {
+): McpConfigPayload {
   const { config, skipped, preserved } = translateMcpServers(servers, policy)
 
   if (Object.keys(config.mcpServers).length === 0) {
-    return { handle: null, skipped, preserved }
+    return { payload: null, skipped, preserved }
   }
 
-  // The file may contain secrets the client sent literally (an Authorization header value, or stdio
-  // `env` values like API keys). `mkdtempSync` gives a 0700 (owner-only) parent dir; write the file
-  // 0600 too as defense-in-depth. The durable way to keep a bearer OFF disk is the policy's
-  // `bearerTokenEnv`, which writes `Bearer $env:VAR` (interpolated by pi-mcp-adapter at connect).
-  let dir: string
-  let path: string
-  try {
-    dir = mkdtempSync(join(tmpdir(), 'pi-acp-mcp-'))
-    path = join(dir, 'mcp.json')
-    writeFileSync(path, JSON.stringify(config, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 })
-  } catch {
-    return { handle: null, skipped, preserved }
-  }
-
-  const cleanup = () => {
-    try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch {
-      // best effort; the file lives in the OS temp dir
-    }
-  }
-
-  return { handle: { path, cleanup }, skipped, preserved }
+  // A bearer token still travels as a header. The policy's `bearerTokenEnv` writes `${VAR}` instead,
+  // which pi interpolates at connect, so the secret itself stays out of the payload.
+  return { payload: Buffer.from(JSON.stringify(config), 'utf-8').toString('base64'), skipped, preserved }
 }
 
 /**
@@ -259,7 +293,11 @@ export function cleanupStaleGeneratedConfig(cwd: string): void {
   }
 }
 
-/** Best-effort check of pi settings for a `pi-mcp-adapter` package entry. */
+/**
+ * Best-effort check of pi settings for a `pi-mcp-adapter` package entry. An extension that registers
+ * `/mcp` replaces pi's built-in MCP support, which means our `registerMcpServer()` calls go nowhere —
+ * so the adapter is a *conflict* now, not a dependency.
+ */
 export function piMcpAdapterInstalled(cwd: string): boolean {
   const settingsPaths = [join(getAgentDir(), 'settings.json'), join(cwd, '.pi', 'settings.json')]
   for (const p of settingsPaths) {
@@ -276,19 +314,20 @@ export function piMcpAdapterInstalled(cwd: string): boolean {
 
 /**
  * Build a one-time, human-readable notice about MCP wiring: which servers we could
- * not translate, and whether pi-mcp-adapter appears to be installed. Returns null
- * when there is nothing worth telling the user.
+ * not translate, and whether `pi-mcp-adapter` is installed (it replaces pi's built-in
+ * MCP support, which breaks registration). Returns null when there is nothing worth
+ * telling the user.
  */
 export function buildMcpNotice(
   cwd: string,
-  result: Pick<WriteMcpConfigResult, 'handle' | 'skipped' | 'preserved'>
+  result: Pick<McpConfigPayload, 'payload' | 'skipped' | 'preserved'>
 ): string | null {
   const lines: string[] = []
 
-  if (result.handle && !piMcpAdapterInstalled(cwd)) {
+  if (result.payload && piMcpAdapterInstalled(cwd)) {
     lines.push(
-      'MCP servers were provided, but `pi-mcp-adapter` does not appear to be installed. ' +
-        'Add it to your pi settings `packages` (see https://github.com/nicobailon/pi-mcp-adapter) for the servers to load.'
+      "MCP servers were provided, but `pi-mcp-adapter` is installed and replaces pi's built-in MCP support, " +
+        'so they cannot be registered. Remove `pi-mcp-adapter` from your pi `packages` to use native MCP.'
     )
   }
 

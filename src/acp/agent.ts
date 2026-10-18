@@ -58,7 +58,7 @@ import {
 } from './pi-acp-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
-import { writeMcpConfig, buildMcpNotice, cleanupStaleGeneratedConfig } from './mcp-config.js'
+import { encodeMcpConfig, buildMcpNotice, cleanupStaleGeneratedConfig } from './mcp-config.js'
 import { isAbsolute } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
@@ -215,11 +215,11 @@ export class PiAcpAgent implements ACPAgent {
 
       const cwd = opts?.cwd ?? stored.cwd
 
-      // Write a session-scoped temp MCP config (passed via `--mcp-config`) when the client supplied
-      // MCP servers (session/load, session/resume). Plain restores (e.g. lazy restore on prompt)
-      // carry no servers and generate nothing. Also clean up a stale generated `<cwd>/.pi/mcp.json`.
+      // Encode ACP mcpServers for pi's native MCP (session/load, session/resume). Plain restores
+      // (e.g. lazy restore on prompt) carry no servers and encode nothing. Also clean up a stale
+      // generated `<cwd>/.pi/mcp.json` a previous pi-acp version left behind.
       cleanupStaleGeneratedConfig(cwd)
-      const mcpWrite = writeMcpConfig(opts?.mcpServers)
+      const mcpConfig = encodeMcpConfig(opts?.mcpServers)
 
       let proc: PiRpcProcess
       try {
@@ -228,7 +228,7 @@ export class PiAcpAgent implements ACPAgent {
           sessionPath: stored.sessionFile,
           piCommand: getPiCommandOverride(),
           additionalDirectories: opts?.additionalDirectories,
-          mcpConfigPath: mcpWrite.handle?.path,
+          mcpConfigPayload: mcpConfig.payload ?? undefined,
           rpcTimeoutMs: getRpcTimeoutMs()
         })
       } catch (e: any) {
@@ -246,7 +246,6 @@ export class PiAcpAgent implements ACPAgent {
         proc,
         fileCommands,
         additionalDirectories: opts?.additionalDirectories,
-        mcpConfigCleanup: mcpWrite.handle?.cleanup,
         clientCapabilities: this.clientCapabilities
       })
 
@@ -290,8 +289,8 @@ export class PiAcpAgent implements ACPAgent {
       }),
       agentCapabilities: {
         loadSession: true,
-        // stdio is the baseline (no flag); http servers are translated into pi-mcp-adapter
-        // config. sse/acp cannot be expressed in that config shape.
+        // stdio is the baseline; http servers are translated into pi's native MCP config shape
+        // (streamable HTTP). sse/acp cannot be expressed — pi rejects `sse`.
         mcpCapabilities: { http: true, sse: false },
         promptCapabilities: {
           image: true,
@@ -328,18 +327,17 @@ export class PiAcpAgent implements ACPAgent {
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
-    // Translate ACP mcpServers into a session-scoped temp MCP config passed to pi via `--mcp-config`
-    // (written before create() so it exists before pi starts). Also clean up any stale
-    // `<cwd>/.pi/mcp.json` a previous pi-acp version generated, so it can't win at highest precedence.
+    // Encode ACP mcpServers for pi's native MCP (the bundled extension registers them for this
+    // session via `pi.registerMcpServer()`). Also clean up any stale `<cwd>/.pi/mcp.json` a previous
+    // pi-acp version generated, so it can't win at highest precedence.
     cleanupStaleGeneratedConfig(params.cwd)
-    const mcpWrite = writeMcpConfig(params.mcpServers)
-    const mcpNotice = buildMcpNotice(params.cwd, mcpWrite)
+    const mcpConfig = encodeMcpConfig(params.mcpServers)
+    const mcpNotice = buildMcpNotice(params.cwd, mcpConfig)
 
     const session = await this.sessions.create({
       cwd: params.cwd,
       mcpServers: params.mcpServers,
-      mcpConfigPath: mcpWrite.handle?.path,
-      mcpConfigCleanup: mcpWrite.handle?.cleanup,
+      mcpConfigPayload: mcpConfig.payload ?? undefined,
       conn: this.conn,
       fileCommands,
       piCommand: getPiCommandOverride(),

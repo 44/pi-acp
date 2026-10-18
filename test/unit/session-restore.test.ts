@@ -85,7 +85,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
         sessionPath: '/tmp/store-project/session.jsonl',
         piCommand: undefined,
         additionalDirectories: undefined,
-        mcpConfigPath: undefined,
+        mcpConfigPayload: undefined,
         rpcTimeoutMs: 120000
       }
     ])
@@ -184,7 +184,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
         sessionPath: sessionFile,
         piCommand: undefined,
         additionalDirectories: undefined,
-        mcpConfigPath: undefined,
+        mcpConfigPayload: undefined,
         rpcTimeoutMs: 120000
       }
     ])

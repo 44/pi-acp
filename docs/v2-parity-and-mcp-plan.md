@@ -1,5 +1,11 @@
 # Plan: ACP v2 (draft) adoption + pi-mcp-adapter auto-configuration
 
+> **Historical (superseded in part).** The MCP half of this plan is done and its design has moved on:
+> ACP `mcpServers` are now registered with pi's **native** MCP support via a bundled pi extension
+> (`src/pi-extension-mcp.ts`, `PI_ACP_MCP_CONFIG`), not by writing `.pi/mcp.json` or a temp overlay for
+> `pi-mcp-adapter` — see the README's [MCP servers](../README.md#mcp-servers). Read the MCP sections
+> below as the record of why the earlier config-file approaches were rejected.
+
 Status: proposal (plan only — no code yet).
 Scope decisions: **MCP config-file auto-write now (v1)**; **v2 built behind the dual-version router but
 held until v2 graduates from experimental to a published non-experimental SDK release**;
