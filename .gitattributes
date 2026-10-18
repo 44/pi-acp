@@ -1,0 +1,2 @@
+# Committed build output (see `just release`); collapse it in diffs/reviews.
+dist/* linguist-generated=true

@@ -4,7 +4,9 @@ const common = {
   format: ['esm'] as const,
   platform: 'node' as const,
   target: 'node22',
-  sourcemap: true,
+  // dist/ is committed and shipped as-is; sourcemaps are dead weight without
+  // `node --enable-source-maps` and would double every release diff.
+  sourcemap: false,
   dts: false,
   splitting: false,
   minify: false

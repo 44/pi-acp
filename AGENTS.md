@@ -36,7 +36,9 @@ Use `@agentclientprotocol/sdk`:
 
 - Install deps: `npm install`
 - Run in dev: `npm run dev`
-- Build: `npm run build`
+- Build: `npm run build` (or `just build`)
+- Typecheck + lint + test: `just check`
+- Release (build, bump version, commit `dist/`, tag `vX.Y.Z`): `just release [patch|minor|major]`
 - Smoke test (stdio): `npm run smoke`
 - Lint: `npm run lint`
 - Test: `npm run test`
