@@ -41,6 +41,10 @@ On top of upstream it adds:
 ## Features
 
 - Streams assistant output as ACP `agent_message_chunk`
+- Reports per-turn token usage on `session/prompt` responses (`PromptResponse.usage`, ACP unstable)
+  - Sums every assistant message of the turn (tool loops, retries, follow-up continuations); reported only when pi has token counts
+  - Turn cost (USD, from pi's model pricing) is attached as `usage._meta.piAcp.cost`, since ACP's `Usage` has no cost field
+  - Context-window usage and cumulative session stats stay available through `/session`
 - Maps pi tool execution to ACP `tool_call` / `tool_call_update`
   - Tool call locations are surfaced when available for ACP clients that support opening the referenced file/context
   - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed

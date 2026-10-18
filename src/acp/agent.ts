@@ -950,9 +950,10 @@ export class PiAcpAgent implements ACPAgent {
     // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
     // unless we know this was a cancellation.
     const stopReason: StopReason =
-      result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
+      result.stopReason === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result.stopReason
 
-    return { stopReason }
+    // Per-turn usage is an unstable ACP capability; only send it when pi actually reported tokens.
+    return result.usage ? { stopReason, usage: result.usage } : { stopReason }
   }
 
   async cancel(params: CancelNotification): Promise<void> {

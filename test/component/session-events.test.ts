@@ -734,7 +734,7 @@ test('PiAcpSession: prompt stays open through retry runs until agent_settled', a
 
   proc.emit({ type: 'agent_settled' })
   const reason = await p
-  assert.equal(reason, 'end_turn')
+  assert.equal(reason.stopReason, 'end_turn')
 })
 
 test('PiAcpSession: does not re-emit startup info on first prompt after it was already sent', async () => {
@@ -775,7 +775,7 @@ test('PiAcpSession: does not re-emit startup info on first prompt after it was a
   proc.emit({ type: 'agent_settled' })
 
   const reason = await p
-  assert.equal(reason, 'end_turn')
+  assert.equal(reason.stopReason, 'end_turn')
 })
 
 test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
@@ -800,7 +800,7 @@ test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
   const reason = await p
 
   assert.equal(proc.abortCount, 1)
-  assert.equal(reason, 'cancelled')
+  assert.equal(reason.stopReason, 'cancelled')
 })
 
 test('PiAcpSession: queues concurrent prompt and starts it after agent_settled', async () => {
@@ -828,7 +828,7 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_settled',
   proc.emit({ type: 'agent_settled' })
 
   const r1 = await first
-  assert.equal(r1, 'end_turn')
+  assert.equal(r1.stopReason, 'end_turn')
 
   assert.equal(proc.prompts.length, 2)
   assert.equal(proc.prompts[1]!.message, 'two')
@@ -839,7 +839,7 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_settled',
   proc.emit({ type: 'agent_settled' })
 
   const r2 = await second
-  assert.equal(r2, 'end_turn')
+  assert.equal(r2.stopReason, 'end_turn')
 })
 
 test('PiAcpSession: cancel clears queued prompts', async () => {
@@ -869,8 +869,8 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   const r1 = await first
   const r2 = await second
 
-  assert.equal(r1, 'cancelled')
-  assert.equal(r2, 'cancelled')
+  assert.equal(r1.stopReason, 'cancelled')
+  assert.equal(r2.stopReason, 'cancelled')
 })
 
 test('PiAcpSession: expands /command before sending to pi', async () => {
@@ -903,7 +903,7 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
   proc.emit({ type: 'agent_settled' })
 
   const reason = await p
-  assert.equal(reason, 'end_turn')
+  assert.equal(reason.stopReason, 'end_turn')
 })
 
 test('PiAcpSession: tags extension notify chunks with severity in _meta', async () => {

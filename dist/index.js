@@ -742,8 +742,8 @@ function parseCommandArgs(argsString) {
 function substituteArgs(content, args) {
   let result = content;
   result = result.replace(/\$@/g, args.join(" "));
-  result = result.replace(/\$(\d+)/g, (_m, num) => {
-    const idx = Number.parseInt(String(num), 10) - 1;
+  result = result.replace(/\$(\d+)/g, (_m, num2) => {
+    const idx = Number.parseInt(String(num2), 10) - 1;
     return args[idx] ?? "";
   });
   return result;
@@ -834,6 +834,50 @@ ${stderr}`);
   } catch {
     return String(result);
   }
+}
+
+// src/acp/translate/usage.ts
+function newTurnUsage() {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 0, costUsd: 0, messages: 0 };
+}
+function num(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function addPiMessageUsage(totals, usage) {
+  if (!usage || typeof usage !== "object") return false;
+  const totalTokens = num(usage.totalTokens);
+  const input2 = num(usage.input);
+  const output2 = num(usage.output);
+  if (!totalTokens && !input2 && !output2) return false;
+  totals.input += input2;
+  totals.output += output2;
+  totals.cacheRead += num(usage.cacheRead);
+  totals.cacheWrite += num(usage.cacheWrite);
+  totals.reasoning += num(usage.reasoning);
+  totals.totalTokens += totalTokens;
+  totals.costUsd += num(usage.cost?.total);
+  totals.messages += 1;
+  return true;
+}
+function addPiMessageEnd(totals, message) {
+  const m = message;
+  if (m?.role !== "assistant") return false;
+  return addPiMessageUsage(totals, m.usage);
+}
+function toAcpUsage(totals) {
+  if (totals.messages === 0) return void 0;
+  const usage = {
+    totalTokens: totals.totalTokens,
+    inputTokens: totals.input,
+    outputTokens: totals.output
+  };
+  if (totals.reasoning > 0) usage.thoughtTokens = totals.reasoning;
+  if (totals.cacheRead > 0) usage.cachedReadTokens = totals.cacheRead;
+  if (totals.cacheWrite > 0) usage.cachedWriteTokens = totals.cacheWrite;
+  if (totals.costUsd > 0) {
+    usage._meta = { piAcp: { cost: { amount: totals.costUsd, currency: "USD" } } };
+  }
+  return usage;
 }
 
 // src/acp/subagent-plan.ts
@@ -1233,6 +1277,8 @@ var PiAcpSession = class {
   // Current in-flight turn (if any). Additional prompts are queued.
   pendingTurn = null;
   turnQueue = [];
+  // Token/cost usage accumulated for the running turn (ACP reports per-turn usage).
+  turnUsage = newTurnUsage();
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -1273,9 +1319,15 @@ var PiAcpSession = class {
     this.pendingTurn = null;
     if (!pending && queued.length === 0) return;
     void this.flushEmits().finally(() => {
-      pending?.resolve(reason);
-      for (const t of queued) t.resolve(reason);
+      pending?.resolve(this.finishTurn(reason));
+      for (const t of queued) t.resolve({ stopReason: reason });
     });
+  }
+  /** Close the running turn: attach accumulated usage and reset the accumulator. */
+  finishTurn(stopReason) {
+    const usage = toAcpUsage(this.turnUsage);
+    this.turnUsage = newTurnUsage();
+    return usage ? { stopReason, usage } : { stopReason };
   }
   setStartupInfo(text) {
     this.startupInfo = text;
@@ -1321,7 +1373,7 @@ var PiAcpSession = class {
     this.cancelRequested = true;
     if (this.turnQueue.length) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length);
-      for (const t of queued) t.resolve("cancelled");
+      for (const t of queued) t.resolve({ stopReason: "cancelled" });
       this.emit({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: "Cleared queued prompts." }
@@ -1414,6 +1466,7 @@ exit code: ${exitCode}` : text;
   }
   startTurn(t) {
     this.cancelRequested = false;
+    this.turnUsage = newTurnUsage();
     this.pendingTurn = { resolve: t.resolve, reject: t.reject };
     this.emit({
       sessionUpdate: "session_info_update",
@@ -1426,7 +1479,7 @@ exit code: ${exitCode}` : text;
           this.pendingTurn?.reject(authErr);
         } else {
           const reason = this.cancelRequested ? "cancelled" : "error";
-          this.pendingTurn?.resolve(reason);
+          this.pendingTurn?.resolve(this.finishTurn(reason));
         }
         this.pendingTurn = null;
         this.emit({
@@ -1696,6 +1749,10 @@ exit code: ${exitCode}` : text;
         this.handleSubagentEntry(ev.entry);
         break;
       }
+      case "message_end": {
+        addPiMessageEnd(this.turnUsage, ev.message);
+        break;
+      }
       case "agent_start": {
         break;
       }
@@ -1708,7 +1765,7 @@ exit code: ${exitCode}` : text;
       case "agent_settled": {
         void this.flushEmits().finally(() => {
           const reason = this.cancelRequested ? "cancelled" : "end_turn";
-          this.pendingTurn?.resolve(reason);
+          this.pendingTurn?.resolve(this.finishTurn(reason));
           this.pendingTurn = null;
           const next = this.turnQueue.shift();
           if (next) {
@@ -3138,8 +3195,8 @@ ${JSON.stringify(stats, null, 2)}`;
       }
     }
     const result = await session.prompt(message, images);
-    const stopReason = result === "error" ? session.wasCancelRequested() ? "cancelled" : "end_turn" : result;
-    return { stopReason };
+    const stopReason = result.stopReason === "error" ? session.wasCancelRequested() ? "cancelled" : "end_turn" : result.stopReason;
+    return result.usage ? { stopReason, usage: result.usage } : { stopReason };
   }
   async cancel(params) {
     const session = this.sessions.maybeGet(params.sessionId);

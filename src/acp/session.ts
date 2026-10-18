@@ -7,7 +7,8 @@ import type {
   SessionUpdate,
   ToolCallContent,
   ToolCallLocation,
-  ToolKind
+  ToolKind,
+  Usage
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
@@ -28,6 +29,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { toolResultToText } from './translate/pi-tools.js'
+import { addPiMessageEnd, newTurnUsage, toAcpUsage, type TurnUsageTotals } from './translate/usage.js'
 import { getPiAcpDebug } from './pi-acp-settings.js'
 import {
   SUBAGENT_PLAN_CUSTOM_TYPE,
@@ -64,15 +66,21 @@ type SessionCreateParams = {
 
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
 
+/** Result of one ACP `session/prompt` turn. `usage` is omitted when pi reported no tokens. */
+export type TurnResult = {
+  stopReason: StopReason
+  usage?: Usage
+}
+
 type PendingTurn = {
-  resolve: (reason: StopReason) => void
+  resolve: (result: TurnResult) => void
   reject: (err: unknown) => void
 }
 
 type QueuedTurn = {
   message: string
   images: unknown[]
-  resolve: (reason: StopReason) => void
+  resolve: (result: TurnResult) => void
   reject: (err: unknown) => void
 }
 
@@ -319,6 +327,8 @@ export class PiAcpSession {
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
   private readonly turnQueue: QueuedTurn[] = []
+  // Token/cost usage accumulated for the running turn (ACP reports per-turn usage).
+  private turnUsage: TurnUsageTotals = newTurnUsage()
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -375,9 +385,16 @@ export class PiAcpSession {
     if (!pending && queued.length === 0) return
 
     void this.flushEmits().finally(() => {
-      pending?.resolve(reason)
-      for (const t of queued) t.resolve(reason)
+      pending?.resolve(this.finishTurn(reason))
+      for (const t of queued) t.resolve({ stopReason: reason })
     })
+  }
+
+  /** Close the running turn: attach accumulated usage and reset the accumulator. */
+  private finishTurn(stopReason: StopReason): TurnResult {
+    const usage = toAcpUsage(this.turnUsage)
+    this.turnUsage = newTurnUsage()
+    return usage ? { stopReason, usage } : { stopReason }
   }
 
   setStartupInfo(text: string) {
@@ -400,11 +417,11 @@ export class PiAcpSession {
     })
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+  async prompt(message: string, images: unknown[] = []): Promise<TurnResult> {
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
-    const turnPromise = new Promise<StopReason>((resolve, reject) => {
+    const turnPromise = new Promise<TurnResult>((resolve, reject) => {
       const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
 
       // If a turn is already running, enqueue.
@@ -444,7 +461,7 @@ export class PiAcpSession {
 
     if (this.turnQueue.length) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
-      for (const t of queued) t.resolve('cancelled')
+      for (const t of queued) t.resolve({ stopReason: 'cancelled' })
 
       this.emit({
         sessionUpdate: 'agent_message_chunk',
@@ -576,6 +593,7 @@ export class PiAcpSession {
 
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
+    this.turnUsage = newTurnUsage()
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
 
@@ -598,7 +616,7 @@ export class PiAcpSession {
           this.pendingTurn?.reject(authErr)
         } else {
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-          this.pendingTurn?.resolve(reason)
+          this.pendingTurn?.resolve(this.finishTurn(reason))
         }
 
         this.pendingTurn = null
@@ -924,6 +942,12 @@ export class PiAcpSession {
         break
       }
 
+      case 'message_end': {
+        // Authoritative final assistant message; carries per-message usage for this turn.
+        addPiMessageEnd(this.turnUsage, (ev as any).message)
+        break
+      }
+
       case 'agent_start': {
         // No adapter state to update; ACP turn completion is driven by `agent_settled`.
         break
@@ -946,7 +970,7 @@ export class PiAcpSession {
         // the ACP `session/prompt` request.
         void this.flushEmits().finally(() => {
           const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
+          this.pendingTurn?.resolve(this.finishTurn(reason))
           this.pendingTurn = null
 
           // Start next queued prompt, if any.

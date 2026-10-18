@@ -23,7 +23,7 @@ test('PiAcpSession: settles the in-flight turn with error when pi exits mid-turn
   proc.emitExit({ code: 1, signal: null })
 
   // The ACP request resolves (as error) instead of hanging forever.
-  assert.equal(await turn, 'error')
+  assert.equal((await turn).stopReason, 'error')
 })
 
 test('PiAcpSession: settles queued turns when pi exits mid-turn', async () => {
@@ -44,6 +44,6 @@ test('PiAcpSession: settles queued turns when pi exits mid-turn', async () => {
 
   proc.emitExit({ code: null, signal: 'SIGKILL' })
 
-  assert.equal(await first, 'error')
-  assert.equal(await second, 'error')
+  assert.equal((await first).stopReason, 'error')
+  assert.equal((await second).stopReason, 'error')
 })
