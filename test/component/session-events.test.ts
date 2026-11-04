@@ -333,6 +333,139 @@ test('PiAcpSession: cancels unsupported input and editor extension UI requests w
   assert.match((conn.updates[1]!.update as any).content.text, /editor UI request is not supported/)
 })
 
+const FORM_ELICITATION_CAPABILITIES = { elicitation: { form: {} } } as const
+
+function elicitingSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess) {
+  return new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    clientCapabilities: FORM_ELICITATION_CAPABILITIES as any
+  })
+}
+
+test('PiAcpSession: routes extension select to a form elicitation with the choices as an enum', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextElicitationResponse = { action: 'accept', content: { value: 'Beta' } }
+  const proc = new FakePiRpcProcess()
+
+  elicitingSession(conn, proc)
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-10',
+    method: 'select',
+    title: 'Pick one',
+    options: ['Alpha', 'Beta']
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.permissionRequests.length, 0, 'select must not fall back to permissions when elicitation works')
+  assert.equal(conn.elicitationRequests.length, 1)
+  const request = conn.elicitationRequests[0] as any
+  assert.equal(request.sessionId, 's1')
+  assert.equal(request.mode, 'form')
+  assert.equal(request.message, 'Pick one')
+  assert.deepEqual(request.requestedSchema, {
+    type: 'object',
+    properties: { value: { type: 'string', title: 'Pick one', enum: ['Alpha', 'Beta'] } },
+    required: ['value']
+  })
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-10', value: 'Beta' }])
+})
+
+test('PiAcpSession: rejects an elicited select value that was not offered', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextElicitationResponse = { action: 'accept', content: { value: 'Gamma' } }
+  const proc = new FakePiRpcProcess()
+
+  elicitingSession(conn, proc)
+
+  proc.emit({ type: 'extension_ui_request', id: 'ui-11', method: 'select', title: 'Pick', options: ['Alpha'] })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-11', cancelled: true }])
+})
+
+test('PiAcpSession: maps elicited confirm to a boolean field and honours decline', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  elicitingSession(conn, proc)
+
+  conn.nextElicitationResponse = { action: 'accept', content: { value: false } }
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-12',
+    method: 'confirm',
+    title: 'Clear session?',
+    message: 'All messages will be lost.'
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  const request = conn.elicitationRequests[0] as any
+  assert.equal(request.message, 'All messages will be lost.')
+  assert.deepEqual(request.requestedSchema.properties.value, { type: 'boolean', title: 'Clear session?' })
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-12', confirmed: false }])
+
+  conn.nextElicitationResponse = { action: 'decline' }
+  proc.emit({ type: 'extension_ui_request', id: 'ui-13', method: 'confirm', title: 'Again?' })
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(proc.extensionUiResponses.at(-1), { id: 'ui-13', cancelled: true })
+})
+
+test('PiAcpSession: routes extension input/editor to a string elicitation field', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  elicitingSession(conn, proc)
+
+  conn.nextElicitationResponse = { action: 'accept', content: { value: 'typed answer' } }
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'ui-14',
+    method: 'input',
+    title: 'Enter name',
+    placeholder: 'type something'
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  const request = conn.elicitationRequests[0] as any
+  assert.equal(request.message, 'Enter name')
+  assert.deepEqual(request.requestedSchema.properties.value, {
+    type: 'string',
+    title: 'Enter name',
+    description: 'type something'
+  })
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-14', value: 'typed answer' }])
+
+  conn.nextElicitationResponse = { action: 'accept', content: { value: 'long text' } }
+  proc.emit({ type: 'extension_ui_request', id: 'ui-15', method: 'editor', title: 'Edit text' })
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal((conn.elicitationRequests[1] as any).message, 'Edit text')
+  assert.deepEqual(proc.extensionUiResponses.at(-1), { id: 'ui-15', value: 'long text' })
+  assert.equal(conn.updates.length, 0, 'no unsupported-UI fallback message when elicitation is available')
+})
+
+test('PiAcpSession: cancels elicitation-backed input when the client declines', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.nextElicitationResponse = { action: 'cancel' }
+  const proc = new FakePiRpcProcess()
+
+  elicitingSession(conn, proc)
+
+  proc.emit({ type: 'extension_ui_request', id: 'ui-16', method: 'input', title: 'Enter name' })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-16', cancelled: true }])
+})
+
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

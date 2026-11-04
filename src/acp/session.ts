@@ -2,6 +2,8 @@ import type {
   AgentSideConnection,
   ClientCapabilities,
   ContentBlock,
+  CreateElicitationResponse,
+  ElicitationPropertySchema,
   McpServer,
   PermissionOption,
   SessionUpdate,
@@ -92,6 +94,8 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+/** Single form field pi-acp uses for every elicited value (Sdk requires a property map, not a bare value). */
+const ELICITATION_FIELD = 'value'
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
@@ -1014,14 +1018,7 @@ export class PiAcpSession {
     }
 
     if (method === 'input' || method === 'editor') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: {
-          type: 'text',
-          text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
-        } satisfies ContentBlock
-      })
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      await this.handleExtensionTextPrompt(ev, id, method)
       return
     }
 
@@ -1088,6 +1085,40 @@ export class PiAcpSession {
     }
   }
 
+  /** Clients advertise elicitation support in `initialize`; omission means we must not send `elicitation/create`. */
+  private supportsFormElicitation(): boolean {
+    return this.clientCapabilities?.elicitation?.form != null
+  }
+
+  /**
+   * Forward one pi extension-UI dialog as an ACP form elicitation. Elicitation carries a form schema, so
+   * every dialog is a single-property form; `message` doubles as the prompt text.
+   * Returns null when the request already answered pi (client error).
+   */
+  private async requestExtensionElicitation(
+    ev: PiRpcEvent,
+    id: string,
+    message: string,
+    property: ElicitationPropertySchema
+  ): Promise<CreateElicitationResponse | null> {
+    try {
+      return await this.conn.createElicitation({
+        sessionId: this.sessionId,
+        mode: 'form',
+        message,
+        requestedSchema: {
+          type: 'object',
+          properties: { [ELICITATION_FIELD]: property },
+          required: [ELICITATION_FIELD]
+        },
+        _meta: { piAcp: { extensionUi: { id, method: stringProp(ev, 'method') } } }
+      })
+    } catch {
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return null
+    }
+  }
+
   private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {
     const rawOptions = ev.options
     const options = Array.isArray(rawOptions) ? rawOptions.map(option => String(option)) : []
@@ -1096,6 +1127,21 @@ export class PiAcpSession {
       return
     }
 
+    const title = stringProp(ev, 'title') ?? 'Choose an option'
+
+    if (this.supportsFormElicitation()) {
+      const response = await this.requestExtensionElicitation(ev, id, title, { type: 'string', title, enum: options })
+      if (response === null) {
+        return
+      }
+
+      const value = elicitationContentValue(response, ELICITATION_FIELD)
+      const selected = typeof value === 'string' && options.includes(value) ? value : null
+      await this.proc.sendExtensionUiResponse(selected === null ? { id, cancelled: true } : { id, value: selected })
+      return
+    }
+
+    // Fallback for clients without elicitation support: a permission prompt with one option per choice.
     const permissionOptions: PermissionOption[] = options.map((name, index) => ({
       optionId: `${CHOICE_OPTION_PREFIX}${index}`,
       name,
@@ -1114,6 +1160,22 @@ export class PiAcpSession {
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
+    const title = stringProp(ev, 'title') ?? 'Confirm'
+    const message = stringProp(ev, 'message') ?? title
+
+    if (this.supportsFormElicitation()) {
+      const response = await this.requestExtensionElicitation(ev, id, message, { type: 'boolean', title })
+      if (response === null) {
+        return
+      }
+
+      const value = elicitationContentValue(response, ELICITATION_FIELD)
+      await this.proc.sendExtensionUiResponse(
+        response.action === 'accept' && typeof value === 'boolean' ? { id, confirmed: value } : { id, cancelled: true }
+      )
+      return
+    }
+
     const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
     if (selected === null) {
       return
@@ -1125,6 +1187,39 @@ export class PiAcpSession {
     }
 
     await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'yes' })
+  }
+
+  /**
+   * `input`/`editor` are free-form text, which has no permission representation. With an eliciting
+   * client they become a form field; otherwise there is nothing to show, so the request is cancelled.
+   */
+  private async handleExtensionTextPrompt(ev: PiRpcEvent, id: string, method: string): Promise<void> {
+    const title = stringProp(ev, 'title') ?? `Pi ${method}`
+    const placeholder = stringProp(ev, 'placeholder')
+
+    if (this.supportsFormElicitation()) {
+      const response = await this.requestExtensionElicitation(ev, id, title, {
+        type: 'string',
+        title,
+        description: placeholder ?? undefined
+      })
+      if (response === null) {
+        return
+      }
+
+      const value = elicitationContentValue(response, ELICITATION_FIELD)
+      await this.proc.sendExtensionUiResponse(typeof value === 'string' ? { id, value } : { id, cancelled: true })
+      return
+    }
+
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: {
+        type: 'text',
+        text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
+      } satisfies ContentBlock
+    })
+    await this.proc.sendExtensionUiResponse({ id, cancelled: true })
   }
 
   private async requestExtensionPermission(
@@ -1143,6 +1238,13 @@ export class PiAcpSession {
       return null
     }
   }
+}
+
+/** Value of the single field pi-acp asks for, or undefined when the user declined/cancelled. */
+function elicitationContentValue(response: CreateElicitationResponse, field: string): unknown {
+  if (response.action !== 'accept') return undefined
+  const content = (response as { content?: Record<string, unknown> | null }).content
+  return content?.[field]
 }
 
 function extensionUiToolCall(id: string, ev: PiRpcEvent) {

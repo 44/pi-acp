@@ -74,22 +74,21 @@ function shouldUseShellForPiCommand(cmd) {
 }
 
 // src/pi-rpc/process.ts
-function resolveBundledMcpExtension() {
+function resolveBundledExtension(name) {
   let here;
   try {
     here = dirname(fileURLToPath(import.meta.url));
   } catch {
     return null;
   }
-  const candidates = [
-    join(here, "pi-extension-mcp.js"),
-    join(here, "pi-extension-mcp.ts"),
-    join(here, "..", "src", "pi-extension-mcp.ts")
-  ];
+  const candidates = [join(here, `${name}.js`), join(here, `${name}.ts`), join(here, "..", "src", `${name}.ts`)];
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
   }
   return null;
+}
+function extensionArg(cmd, path) {
+  return shouldUseShellForPiCommand(cmd) ? `"${path}"` : path;
 }
 var PiRpcSpawnError = class extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -183,11 +182,13 @@ var PiRpcProcess = class _PiRpcProcess {
     const args = ["--mode", "rpc", "--no-themes"];
     if (params.sessionPath) args.push("--session", params.sessionPath);
     const env = { ...process.env, PI_ACP: "1" };
+    const askUserExtensionPath = resolveBundledExtension("pi-extension-ask-user");
+    if (askUserExtensionPath) args.push("--extension", extensionArg(cmd, askUserExtensionPath));
     if (params.mcpConfigPayload) {
-      const extensionPath = resolveBundledMcpExtension();
+      const extensionPath = resolveBundledExtension("pi-extension-mcp");
       if (extensionPath) {
         env.PI_ACP_MCP_CONFIG = params.mcpConfigPayload;
-        args.push("--extension", shouldUseShellForPiCommand(cmd) ? `"${extensionPath}"` : extensionPath);
+        args.push("--extension", extensionArg(cmd, extensionPath));
       } else {
         process.stderr.write(
           "[pi-acp] bundled MCP bridge extension not found; ACP-provided MCP servers will not load\n"
@@ -1086,6 +1087,7 @@ var CONFIRM_PERMISSION_OPTIONS = [
 ];
 var EXTENSION_UI_RAW_INPUT_KEYS = ["title", "message", "options", "placeholder", "prefill"];
 var CHOICE_OPTION_PREFIX = "choice-";
+var ELICITATION_FIELD = "value";
 function findUniqueLineNumber(text, needle) {
   if (!needle) return void 0;
   const first = text.indexOf(needle);
@@ -1802,14 +1804,7 @@ exit code: ${exitCode}` : text;
       return;
     }
     if (method === "input" || method === "editor") {
-      this.emit({
-        sessionUpdate: "agent_message_chunk",
-        content: {
-          type: "text",
-          text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
-        }
-      });
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true });
+      await this.handleExtensionTextPrompt(ev, id, method);
       return;
     }
     if (method === "notify") {
@@ -1867,11 +1862,49 @@ exit code: ${exitCode}` : text;
       });
     }
   }
+  /** Clients advertise elicitation support in `initialize`; omission means we must not send `elicitation/create`. */
+  supportsFormElicitation() {
+    return this.clientCapabilities?.elicitation?.form != null;
+  }
+  /**
+   * Forward one pi extension-UI dialog as an ACP form elicitation. Elicitation carries a form schema, so
+   * every dialog is a single-property form; `message` doubles as the prompt text.
+   * Returns null when the request already answered pi (client error).
+   */
+  async requestExtensionElicitation(ev, id, message, property) {
+    try {
+      return await this.conn.createElicitation({
+        sessionId: this.sessionId,
+        mode: "form",
+        message,
+        requestedSchema: {
+          type: "object",
+          properties: { [ELICITATION_FIELD]: property },
+          required: [ELICITATION_FIELD]
+        },
+        _meta: { piAcp: { extensionUi: { id, method: stringProp(ev, "method") } } }
+      });
+    } catch {
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true });
+      return null;
+    }
+  }
   async handleExtensionSelect(ev, id) {
     const rawOptions = ev.options;
     const options = Array.isArray(rawOptions) ? rawOptions.map((option) => String(option)) : [];
     if (!options.length) {
       await this.proc.sendExtensionUiResponse({ id, cancelled: true });
+      return;
+    }
+    const title = stringProp(ev, "title") ?? "Choose an option";
+    if (this.supportsFormElicitation()) {
+      const response = await this.requestExtensionElicitation(ev, id, title, { type: "string", title, enum: options });
+      if (response === null) {
+        return;
+      }
+      const value2 = elicitationContentValue(response, ELICITATION_FIELD);
+      const selected2 = typeof value2 === "string" && options.includes(value2) ? value2 : null;
+      await this.proc.sendExtensionUiResponse(selected2 === null ? { id, cancelled: true } : { id, value: selected2 });
       return;
     }
     const permissionOptions = options.map((name, index2) => ({
@@ -1889,6 +1922,19 @@ exit code: ${exitCode}` : text;
     await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value });
   }
   async handleExtensionConfirm(ev, id) {
+    const title = stringProp(ev, "title") ?? "Confirm";
+    const message = stringProp(ev, "message") ?? title;
+    if (this.supportsFormElicitation()) {
+      const response = await this.requestExtensionElicitation(ev, id, message, { type: "boolean", title });
+      if (response === null) {
+        return;
+      }
+      const value = elicitationContentValue(response, ELICITATION_FIELD);
+      await this.proc.sendExtensionUiResponse(
+        response.action === "accept" && typeof value === "boolean" ? { id, confirmed: value } : { id, cancelled: true }
+      );
+      return;
+    }
     const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS);
     if (selected === null) {
       return;
@@ -1898,6 +1944,35 @@ exit code: ${exitCode}` : text;
       return;
     }
     await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === "yes" });
+  }
+  /**
+   * `input`/`editor` are free-form text, which has no permission representation. With an eliciting
+   * client they become a form field; otherwise there is nothing to show, so the request is cancelled.
+   */
+  async handleExtensionTextPrompt(ev, id, method) {
+    const title = stringProp(ev, "title") ?? `Pi ${method}`;
+    const placeholder = stringProp(ev, "placeholder");
+    if (this.supportsFormElicitation()) {
+      const response = await this.requestExtensionElicitation(ev, id, title, {
+        type: "string",
+        title,
+        description: placeholder ?? void 0
+      });
+      if (response === null) {
+        return;
+      }
+      const value = elicitationContentValue(response, ELICITATION_FIELD);
+      await this.proc.sendExtensionUiResponse(typeof value === "string" ? { id, value } : { id, cancelled: true });
+      return;
+    }
+    this.emit({
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
+      }
+    });
+    await this.proc.sendExtensionUiResponse({ id, cancelled: true });
   }
   async requestExtensionPermission(id, ev, options) {
     try {
@@ -1912,6 +1987,11 @@ exit code: ${exitCode}` : text;
     }
   }
 };
+function elicitationContentValue(response, field) {
+  if (response.action !== "accept") return void 0;
+  const content = response.content;
+  return content?.[field];
+}
 function extensionUiToolCall(id, ev) {
   const method = stringProp(ev, "method") ?? "ui";
   const title = stringProp(ev, "title") ?? `Pi ${method}`;

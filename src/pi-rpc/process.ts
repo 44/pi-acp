@@ -7,27 +7,26 @@ import { fileURLToPath } from 'node:url'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
 
 /**
- * Locate the MCP bridge extension that ships with this package (`src/pi-extension-mcp.ts`, built to
- * `dist/pi-extension-mcp.js`). Resolved relative to this module so it works from `dist/` (npx,
- * `pi install`) and from `src/` (tsx dev). Returns null when neither exists — the session still
- * starts, just without ACP-provided MCP servers.
+ * Locate a pi extension bundled with this package (built next to `dist/index.js`, or the TypeScript
+ * source when running from a checkout). Returns null when neither is present.
  */
-function resolveBundledMcpExtension(): string | null {
+function resolveBundledExtension(name: string): string | null {
   let here: string
   try {
     here = dirname(fileURLToPath(import.meta.url))
   } catch {
     return null
   }
-  const candidates = [
-    join(here, 'pi-extension-mcp.js'),
-    join(here, 'pi-extension-mcp.ts'),
-    join(here, '..', 'src', 'pi-extension-mcp.ts')
-  ]
+  const candidates = [join(here, `${name}.js`), join(here, `${name}.ts`), join(here, '..', 'src', `${name}.ts`)]
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate
   }
   return null
+}
+
+/** Quote an `--extension` path when pi runs through a shell (Windows launcher scripts). */
+function extensionArg(cmd: string, path: string): string {
+  return shouldUseShellForPiCommand(cmd) ? `"${path}"` : path
 }
 
 export class PiRpcSpawnError extends Error {
@@ -232,11 +231,17 @@ export class PiRpcProcess {
     // servers to pi's own `pi.registerMcpServer()` API through the extension bundled with this
     // package; the payload rides in the environment and is deleted by the extension on load.
     const env: NodeJS.ProcessEnv = { ...process.env, PI_ACP: '1' }
+
+    // Model-facing `ask_user` tool. Without it the model has no way to reach the user at all: pi's
+    // built-in tools never call `ctx.ui`, so no `extension_ui_request` is ever emitted.
+    const askUserExtensionPath = resolveBundledExtension('pi-extension-ask-user')
+    if (askUserExtensionPath) args.push('--extension', extensionArg(cmd, askUserExtensionPath))
+
     if (params.mcpConfigPayload) {
-      const extensionPath = resolveBundledMcpExtension()
+      const extensionPath = resolveBundledExtension('pi-extension-mcp')
       if (extensionPath) {
         env.PI_ACP_MCP_CONFIG = params.mcpConfigPayload
-        args.push('--extension', shouldUseShellForPiCommand(cmd) ? `"${extensionPath}"` : extensionPath)
+        args.push('--extension', extensionArg(cmd, extensionPath))
       } else {
         process.stderr.write(
           '[pi-acp] bundled MCP bridge extension not found; ACP-provided MCP servers will not load\n'
